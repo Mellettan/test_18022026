@@ -1,0 +1,184 @@
+"""
+Скрипт для инициализации тестовой и продуктовой баз данных PostgreSQL
+с предопределенными схемами и данными.
+
+Использует Docker Compose для взаимодействия с базами данных,
+а также библиотеку rich для форматированного вывода в консоль.
+"""
+
+import subprocess
+import sys
+from time import sleep
+from rich.console import Console
+from show_db import show_table
+
+console = Console()
+
+
+def run_sql(container: str, user: str, database: str, sql: str):
+    """
+    Выполняет SQL-скрипт в указанной базе данных внутри Docker-контейнера.
+
+    Аргументы:
+        container (str): Имя Docker-контейнера базы данных (например, 'test-db').
+        user (str): Имя пользователя PostgreSQL для подключения.
+        database (str): Имя базы данных PostgreSQL.
+        sql (str): SQL-сккрипт для выполнения.
+
+    Исключения:
+        SystemExit: Если выполнение SQL-скрипта завершается ошибкой.
+    """
+    try:
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "docker-compose.test.yml",
+                "exec",
+                "-T",
+                container,
+                "psql",
+                "-U",
+                user,
+                "-d",
+                database,
+            ],
+            input=sql.encode("utf-8"),
+            check=True,
+            capture_output=True,
+        )
+        console.print(
+            f"[green][+] База данных '{container}' успешно подготовлена.[/green]"
+        )
+    except subprocess.CalledProcessError as e:
+        console.print(
+            f"[red][!] Ошибка при подготовке базы данных '{container}': {e.stderr.decode()}[/red]"
+        )
+        sys.exit(1)
+
+
+def main():
+    """
+    Основная функция скрипта для заполнения баз данных.
+
+    Выполняет следующие шаги:
+    1. Подготавливает тестовую базу данных (`test-db`) с таблицами `users`, `products`, `test_only_logs`.
+    2. Подготавливает продуктовую базу данных (`prod-db`) с таблицами `users`, `products`, `prod_legacy_archive`.
+    3. Вставляет тестовые данные в обе базы.
+    4. Выводит текущее состояние всех таблиц для визуальной проверки.
+    """
+    # ---------- TEST DB ----------
+    console.print("[bold cyan]Подготовка тестовой базы данных (TEST DB)[/bold cyan]")
+    test_sql = """
+    -- Удаление существующих таблиц для чистого состояния
+    DROP TABLE IF EXISTS public.users CASCADE;
+    DROP TABLE IF EXISTS public.products CASCADE;
+    DROP TABLE IF EXISTS public.test_only_logs CASCADE;
+
+    -- Создание таблицы пользователей в тестовой базе
+    CREATE TABLE public.users (
+        id SERIAL PRIMARY KEY,
+        username TEXT NOT NULL,
+        email TEXT UNIQUE,
+        is_active BOOLEAN DEFAULT TRUE
+    );
+
+    -- Создание таблицы продуктов в тестовой базе
+    CREATE TABLE public.products (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        sku TEXT,
+        price NUMERIC(10, 2)
+    );
+
+    -- Создание таблицы логов, специфичной для тестовой среды
+    CREATE TABLE public.test_only_logs (
+        id SERIAL PRIMARY KEY,
+        message TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    -- Вставка тестовых данных в таблицу пользователей
+    INSERT INTO public.users (username, email) VALUES
+        ('admin', 'admin@test.com'),
+        ('developer', 'dev@test.com'),
+        ('tester', 'test@test.com');
+
+    -- Вставка тестовых данных в таблицу продуктов
+    INSERT INTO public.products (title, sku, price) VALUES
+        ('Laptop Pro', 'LPT-001', 1500.00),
+        ('Mechanical Keyboard', 'KBD-42', 120.50);
+
+    -- Вставка тестовых данных в таблицу логов
+    INSERT INTO public.test_only_logs (message) VALUES
+        ('Database seeded'),
+        ('Test log entry');
+    """
+    run_sql("test-db", "test_user", "test", test_sql)
+
+    # ---------- PROD DB ----------
+    console.print(
+        "\n[bold cyan]Подготовка продуктовой базы данных (PROD DB)[/bold cyan]"
+    )
+    prod_sql = """
+    -- Удаление существующих таблиц для чистого состояния
+    DROP TABLE IF EXISTS public.users CASCADE;
+    DROP TABLE IF EXISTS public.products CASCADE;
+    DROP TABLE IF EXISTS public.prod_legacy_archive CASCADE;
+
+    -- Создание таблицы пользователей в продуктовой базе (отличается от тестовой)
+    CREATE TABLE public.users (
+        id SERIAL PRIMARY KEY,
+        username TEXT NOT NULL,
+        phone TEXT
+    );
+
+    -- Создание таблицы продуктов в продуктовой базе (отличается от тестовой)
+    CREATE TABLE public.products (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        stock_count INTEGER DEFAULT 0
+    );
+
+    -- Создание таблицы для архивных данных, специфичной для продуктовой среды
+    CREATE TABLE public.prod_legacy_archive (
+        id SERIAL PRIMARY KEY,
+        old_data TEXT,
+        archived_at DATE DEFAULT CURRENT_DATE
+    );
+
+    -- Вставка тестовых данных в таблицу пользователей
+    INSERT INTO public.users (id, username, phone) VALUES
+        (1, 'admin', '+79991234567'),
+        (5, 'old_manager', '+70001112233');
+
+    -- Вставка тестовых данных в таблицу продуктов
+    INSERT INTO public.products (title, stock_count) VALUES
+        ('Laptop Pro', 5),
+        ('Old Mouse', 100);
+
+    -- Вставка тестовых данных в таблицу архивных данных
+    INSERT INTO public.prod_legacy_archive (old_data) VALUES
+        ('Legacy record 2023');
+    """
+    run_sql("prod-db", "prod_user", "prod", prod_sql)
+
+    sleep(1)  # Небольшая задержка для стабильности вывода
+    console.print(
+        "\n[bold yellow]Текущее состояние таблиц после заполнения:[/bold yellow]"
+    )
+    show_table("test-db", "test_user", "test", "users")
+    show_table("test-db", "test_user", "test", "products")
+    show_table("test-db", "test_user", "test", "test_only_logs")
+    show_table("prod-db", "prod_user", "prod", "users")
+    show_table("prod-db", "prod_user", "prod", "products")
+    show_table("prod-db", "prod_user", "prod", "prod_legacy_archive")
+
+    console.print(
+        "\n[bold green]Готово! 2 таблицы совпадают по имени (users, products), 1 различается (test_only_logs/prod_legacy_archive) ✅[/bold green]"
+    )
+
+
+if __name__ == "__main__":
+    main()
