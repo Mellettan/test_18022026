@@ -14,7 +14,13 @@ from typing import Iterable
 from loguru import logger
 
 from .config import SyncConfig
-from .database import ColumnSchema, PostgresInspector, SchemaSnapshot, TableSchema
+from .database import (
+    ColumnSchema,
+    ForeignKeySchema,
+    PostgresInspector,
+    SchemaSnapshot,
+    TableSchema,
+)
 
 
 @dataclass
@@ -23,23 +29,25 @@ class SchemaDiff:
     Представляет различия между двумя схемами баз данных.
 
     Атрибуты:
-        new_tables (list[TableSchema]): Список таблиц, присутствующих в тестовой схеме,
-                                        но отсутствующих в продуктовой.
-        missing_tables (list[TableSchema]): Список таблиц, присутствующих в продуктовой схеме,
-                                            но отсутствующих в тестовой (потенциальные "лишние" таблицы).
-        orphan_columns (dict[str, list[str]]): Словарь, где ключ — имя таблицы, а значение —
-                                                список имен колонок, присутствующих в продуктовой таблице,
-                                                но отсутствующих в тестовой (потенциальные "лишние" колонки).
-        missing_columns (dict[str, list[ColumnSchema]]): Словарь, где ключ — имя таблицы, а значение —
-                                                         список объектов `ColumnSchema`,
-                                                         присутствующих в тестовой таблице,
-                                                         но отсутствующих в продуктовой.
+        new_tables (list[TableSchema]): Таблицы, которые нужно добавить в продовую базу.
+        missing_tables (list[TableSchema]): Таблицы, которые есть в продовой базе, но отсутствуют в тестовой.
+        orphan_columns (dict[str, list[str]]): "Лишние" колонки в продовой схеме.
+        missing_columns (dict[str, list[ColumnSchema]]): Колонки, отсутствующие в продовой схеме.
+        missing_foreign_keys (dict[str, list[ForeignKeySchema]]): Внешние ключи, которых нет в продовой базе.
     """
 
     new_tables: list[TableSchema]
     missing_tables: list[TableSchema]
     orphan_columns: dict[str, list[str]]
     missing_columns: dict[str, list[ColumnSchema]]
+    missing_foreign_keys: dict[str, list[ForeignKeySchema]]
+
+
+def _fk_signature(fk: ForeignKeySchema) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+    """
+    Подпись внешнего ключа для сравнения.
+    """
+    return fk.columns, fk.referenced_table, fk.referenced_columns
 
 
 def _compute_diff(
@@ -62,10 +70,13 @@ def _compute_diff(
     missing_tables: list[TableSchema] = []
     orphan_columns: dict[str, list[str]] = {}
     missing_columns: dict[str, list[ColumnSchema]] = {}
+    missing_foreign_keys: dict[str, list[ForeignKeySchema]] = {}
 
     # Проверяем таблицы в тестовой схеме на наличие в продуктовой.
     for table in test_schema.tables.values():
         if table.name not in prod_schema.tables:
+            if table.foreign_keys:
+                missing_foreign_keys.setdefault(table.name, []).extend(table.foreign_keys)
             logger.info("Обнаружена новая таблица в тестовой схеме", table=table.name)
             new_tables.append(table)
             continue
@@ -92,6 +103,19 @@ def _compute_diff(
             )
             missing_columns.setdefault(table.name, []).extend(missing)
 
+        prod_fk_signatures = {
+            _fk_signature(fk): fk for fk in prod_table.foreign_keys
+        }
+        for fk in table.foreign_keys:
+            signature = _fk_signature(fk)
+            if signature not in prod_fk_signatures:
+                logger.info(
+                    "Обнаружен отсутствующий внешний ключ в продуктовой базе",
+                    table=table.name,
+                    constraint=fk.constraint_name,
+                )
+                missing_foreign_keys.setdefault(table.name, []).append(fk)
+
     # Проверяем таблицы в продуктовой схеме на наличие в тестовой.
     for table in prod_schema.tables.values():
         if table.name not in test_schema.tables:
@@ -100,11 +124,15 @@ def _compute_diff(
             )
             missing_tables.append(table)
 
-    logger.debug(
-        "Различия схемы вычислены.",
-        diff=SchemaDiff(new_tables, missing_tables, orphan_columns, missing_columns),
+    diff = SchemaDiff(
+        new_tables,
+        missing_tables,
+        orphan_columns,
+        missing_columns,
+        missing_foreign_keys,
     )
-    return SchemaDiff(new_tables, missing_tables, orphan_columns, missing_columns)
+    logger.debug("Различия схемы вычислены.", diff=diff)
+    return diff
 
 
 def _prompt_discard(objects: Iterable[str]) -> bool:
@@ -400,6 +428,15 @@ def run_sync(config: SyncConfig) -> None:
                 "Таблица, существующая только в продуктовой базе, сохранена по запросу пользователя.",
                 table=table.name,
             )
+
+    for table_name, foreign_keys in diff.missing_foreign_keys.items():
+        for fk in foreign_keys:
+            logger.info(
+                "Добавление отсутствующего внешнего ключа в продуктовую базу.",
+                table=table_name,
+                constraint=fk.constraint_name,
+            )
+            inspector.add_foreign_key(table_name, fk)
 
     # Повторно получаем схему продуктовой базы после применения изменений.
     prod_snap = inspector.fetch_schema()

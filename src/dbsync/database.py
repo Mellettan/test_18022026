@@ -46,11 +46,26 @@ class TableSchema:
         columns (tuple[ColumnSchema, ...]): Кортеж объектов `ColumnSchema`,
                                             описывающих колонки таблицы.
         primary_key (tuple[str, ...]): Кортеж имен колонок, составляющих первичный ключ таблицы.
+        foreign_keys (tuple[ForeignKeySchema, ...]): Кортеж внешних ключей в таблице.
     """
 
     name: str
     columns: tuple[ColumnSchema, ...]
     primary_key: tuple[str, ...]
+    foreign_keys: tuple["ForeignKeySchema", ...] = ()
+
+
+@dataclass(frozen=True)
+class ForeignKeySchema:
+    """Представляет внешнюю ссылку между таблицами PostgreSQL."""
+
+    constraint_name: str
+    columns: tuple[str, ...]
+    referenced_table: str
+    referenced_columns: tuple[str, ...]
+    on_update: str | None
+    on_delete: str | None
+    match_option: str | None
 
 
 @dataclass(frozen=True)
@@ -59,7 +74,7 @@ class SchemaSnapshot:
     Представляет снимок (snapshot) схемы базы данных, содержащий информацию обо всех таблицах.
 
     Атрибуты:
-        tables (Mapping[str, TableSchema]): Словарь, где ключом является имя таблицы,
+tables (Mapping[str, TableSchema]): Словарь, где ключом является имя таблицы,
                                             а значением — объект `TableSchema`.
     """
 
@@ -96,6 +111,34 @@ WHERE n.nspname = 'public'
   AND a.attnum > 0
   AND NOT a.attisdropped
 ORDER BY c.relname, a.attnum;
+"""
+
+
+FOREIGN_KEYS_QUERY = """
+SELECT
+    rel.relname AS table_name,
+    con.conname AS constraint_name,
+    col.attname AS column_name,
+    conf.relname AS referenced_table,
+    conf_col.attname AS referenced_column,
+    rc.update_rule,
+    rc.delete_rule,
+    rc.match_option,
+    cols.ord AS column_position
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS cols(attnum, ordinality) ON TRUE
+JOIN pg_attribute col ON col.attrelid = con.conrelid AND col.attnum = cols.attnum
+JOIN pg_class conf ON conf.oid = con.confrelid
+JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS conf_cols(attnum, ordinality) ON conf_cols.ordinality = cols.ordinality
+JOIN pg_attribute conf_col ON conf_col.attrelid = con.confrelid AND conf_col.attnum = conf_cols.attnum
+LEFT JOIN information_schema.referential_constraints rc
+    ON rc.constraint_name = con.conname
+    AND rc.constraint_schema = nsp.nspname
+WHERE con.contype = 'f'
+  AND nsp.nspname = 'public'
+ORDER BY rel.relname, con.conname, cols.ord;
 """
 
 # SQL-запрос для получения информации о первичном ключе для всех таблиц в схеме 'public'.

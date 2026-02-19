@@ -1,12 +1,19 @@
 import pytest
 
+from typing import Any, Sequence
+
 from unittest.mock import MagicMock, patch
 
-from dbsync.database import ColumnSchema, SchemaSnapshot, TableSchema
-from dbsync.runner import SchemaDiff, _compute_diff, _select_sync_column, _sync_data
+from dbsync.config import SyncConfig
+from dbsync.database import ColumnSchema, ForeignKeySchema, SchemaSnapshot, TableSchema
+from dbsync.runner import SchemaDiff, _compute_diff, _select_sync_column, _sync_data, run_sync
 
 
-def _mk_table(name: str, column_names: list[str]) -> TableSchema:
+def _mk_table(
+    name: str,
+    column_names: list[str],
+    foreign_keys: tuple[ForeignKeySchema, ...] = (),
+) -> TableSchema:
     """
     Вспомогательная функция для создания объекта TableSchema.
     """
@@ -15,7 +22,27 @@ def _mk_table(name: str, column_names: list[str]) -> TableSchema:
         for col in column_names
     ]
     return TableSchema(
-        name=name, columns=tuple(cols), primary_key=tuple(cols[0].name for _ in (0,))
+        name=name,
+        columns=tuple(cols),
+        primary_key=tuple(cols[0].name for _ in (0,)),
+        foreign_keys=foreign_keys,
+    )
+
+
+def _mk_fk(
+    constraint_name: str = "fk",
+    columns: tuple[str, ...] = ("user_id",),
+    referenced_table: str = "users",
+    referenced_columns: tuple[str, ...] = ("id",),
+) -> ForeignKeySchema:
+    return ForeignKeySchema(
+        constraint_name=constraint_name,
+        columns=columns,
+        referenced_table=referenced_table,
+        referenced_columns=referenced_columns,
+        on_update="NO ACTION",
+        on_delete="NO ACTION",
+        match_option=None,
     )
 
 
@@ -67,6 +94,103 @@ def test_compute_diff_reports_orphan_and_missing_columns() -> None:
     assert diff.orphan_columns == {"users": ["email"]}
     # Проверяем, что 'name' обнаружена как отсутствующая колонка
     assert {col.name for col in diff.missing_columns["users"]} == {"name"}
+
+
+def test_compute_diff_reports_missing_foreign_keys() -> None:
+    fk = _mk_fk(constraint_name="users_fk")
+    test_table = _mk_table("orders", ["id", "user_id"], foreign_keys=(fk,))
+    prod_table = _mk_table("orders", ["id", "user_id"])
+
+    test_schema = SchemaSnapshot.from_tables([test_table])
+    prod_schema = SchemaSnapshot.from_tables([prod_table])
+
+    diff = _compute_diff(test_schema, prod_schema)
+    assert diff.missing_foreign_keys == {"orders": [fk]}
+
+
+def test_compute_diff_includes_foreign_keys_for_new_tables() -> None:
+    fk = _mk_fk(constraint_name="users_fk")
+    test_table = _mk_table("orders", ["id", "user_id"], foreign_keys=(fk,))
+
+    test_schema = SchemaSnapshot.from_tables([test_table])
+    prod_schema = SchemaSnapshot.from_tables([])
+
+    diff = _compute_diff(test_schema, prod_schema)
+    assert diff.new_tables[0].name == "orders"
+    assert diff.missing_foreign_keys == {"orders": [fk]}
+
+
+def test_run_sync_adds_missing_foreign_keys(monkeypatch) -> None:
+    fk = _mk_fk(constraint_name="orders_fk")
+    test_table = _mk_table("orders", ["id", "user_id"], foreign_keys=(fk,))
+    prod_table = _mk_table("orders", ["id", "user_id"])
+
+    test_snapshot = SchemaSnapshot.from_tables([test_table])
+    prod_snapshot = SchemaSnapshot.from_tables([prod_table])
+
+    snapshots = iter([test_snapshot, prod_snapshot, prod_snapshot])
+    inspector_instances: list["FakeInspector"] = []
+
+    class FakeInspector:
+        def __init__(self, dsn: str) -> None:
+            self.dsn = dsn
+            self.added_foreign_keys: list[tuple[str, ForeignKeySchema]] = []
+            inspector_instances.append(self)
+
+        def fetch_schema(self) -> SchemaSnapshot:
+            return next(snapshots)
+
+        def create_table(self, table: TableSchema) -> None:
+            pass
+
+        def add_column(self, table_name: str, column: ColumnSchema) -> None:
+            pass
+
+        def drop_column(self, table_name: str, column_name: str) -> None:
+            pass
+
+        def drop_table(self, table_name: str) -> None:
+            pass
+
+        def add_foreign_key(self, table_name: str, fk: ForeignKeySchema) -> None:
+            self.added_foreign_keys.append((table_name, fk))
+
+        # _sync_data helpers
+        def fetch_rows(self, table_name: str, columns: list[str]) -> list[dict[str, Any]]:
+            return []
+
+        def fetch_primary_key_values(
+            self, table_name: str, primary_key: Sequence[str]
+        ) -> set[tuple[Any, ...]]:
+            return set()
+
+        def insert_rows(
+            self, table_name: str, columns: Sequence[str], rows: Sequence[dict[str, Any]]
+        ) -> int:
+            return 0
+
+        def update_rows(
+            self,
+            table_name: str,
+            sync_key: Sequence[str],
+            columns: Sequence[str],
+            rows: Sequence[dict[str, Any]],
+        ) -> int:
+            return 0
+
+        def is_column_unique(self, table_name: str, column_name: str) -> bool:
+            return True
+
+    monkeypatch.setattr("dbsync.runner.PostgresInspector", FakeInspector)
+    monkeypatch.setattr("dbsync.runner._select_sync_column", lambda *args, **kwargs: ("id",))
+
+    config = SyncConfig(test_dsn="test", prod_dsn="prod")
+    run_sync(config)
+
+    prod_inspectors = [inst for inst in inspector_instances if inst.dsn == "prod"]
+    assert prod_inspectors, "No PostgresInspector(prod) instances were created"
+    last_prod_inspector = prod_inspectors[-1]
+    assert last_prod_inspector.added_foreign_keys == [("orders", fk)]
 
 
 @pytest.fixture
